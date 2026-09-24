@@ -102,6 +102,37 @@ driver choose whether pinned pages use ordinary system RAM or an APU GTT apertur
 HIP does not expose a portable API to force Vega GTT placement or a peer-SDMA
 route. Pageable CPU tensors are rejected rather than dereferenced by a kernel.
 
+Independent inference requests can be distributed across every visible HIP GPU
+with one long-lived model worker per device:
+
+```python
+import torch
+
+from comfy_kitchen import HIPInferencePool
+
+
+def create_worker(device):
+  model = load_model().to(device).eval()
+
+  @torch.inference_mode()
+  def infer(request):
+    return model(request)
+
+  return infer
+
+
+requests = [load_request(path) for path in paths]
+with HIPInferencePool(create_worker, output_device="cpu") as pool:
+  results = pool.map(requests)
+```
+
+The pool detects all visible devices, constructs each worker on its dedicated
+GPU thread, moves nested tensor inputs to that GPU, and schedules requests
+round-robin. Results preserve request order. Omit `output_device` to leave each
+result on the GPU that produced it, or pass `move_inputs=False` when the worker
+manages placement itself. This is request-level parallelism: each request must
+be independent, and model weights must fit on every participating GPU.
+
 A request outside a kernel's domain (swizzled operands, scaling other than
 tensor-wise, a K that is not a multiple of 16) falls back to torch or eager.
 NVFP4 and MXFP8 stay on eager everywhere: RDNA has neither fp4 WMMA nor

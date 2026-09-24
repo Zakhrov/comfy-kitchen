@@ -6,7 +6,9 @@ from .backends import cuda as _cuda_backend
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
-from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
+from .backends.cuda import (
+    sol_attn_chunked,
+)  # chunked-producer form of sol_attn (HIP's below)
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -20,6 +22,7 @@ from .flash_attention import is_available as flash_attention_decode_is_available
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
+from .hip_inference import HIPInferencePool
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -121,6 +124,7 @@ __all__ = [
     "to_blocked",
     "from_blocked",
     "set_allocation_context",
+    "HIPInferencePool",
     # Backend configuration
     "list_backends",
     "set_backend_priority",
@@ -196,7 +200,11 @@ def sol_attn(
         ``(B, T, H, 128)`` attention output.
     """
     return torch.ops.comfy_kitchen.sol_attn(
-        q, k, v, tau, scale,
+        q,
+        k,
+        v,
+        tau,
+        scale,
         [0, 0] if sink_blocks is None else list(sink_blocks),
         [0, 0] if sink_q is None else list(sink_q),
         key_bias,
@@ -217,12 +225,19 @@ def sol_attn_is_available(device: torch.device | int | None = None) -> bool:
     if getattr(torch.version, "hip", None):
         # torch.cuda is the ROCm API here; the HIP backend advertises sol_attn
         # only on WMMA parts, so its registration is the answer
-        return registry.is_available("hip") and registry.get_constraints("hip", "sol_attn") is not None
+        return (
+            registry.is_available("hip")
+            and registry.get_constraints("hip", "sol_attn") is not None
+        )
     rules = registry.get_constraints("cuda", "sol_attn")
     ext = getattr(_cuda_backend, "_C", None)
-    return (registry.is_available("cuda") and _cuda_backend._EXT_AVAILABLE and hasattr(ext, "sol_attn")
-            and rules is not None
-            and torch.cuda.get_device_capability(device) >= rules.min_compute_capability)
+    return (
+        registry.is_available("cuda")
+        and _cuda_backend._EXT_AVAILABLE
+        and hasattr(ext, "sol_attn")
+        and rules is not None
+        and torch.cuda.get_device_capability(device) >= rules.min_compute_capability
+    )
 
 
 def na3d(
@@ -281,12 +296,18 @@ def na2d(
         is_causal = [is_causal] * 2
     # Checked here: both lists gain a T entry below, hiding a wrong length.
     if len(kernel_size) != 2:
-        raise ValueError(f"na2d kernel_size must have 2 elements, got {len(kernel_size)}")
+        raise ValueError(
+            f"na2d kernel_size must have 2 elements, got {len(kernel_size)}"
+        )
     if len(is_causal) != 2:
         raise ValueError(f"na2d is_causal must have 2 elements, got {len(is_causal)}")
     out = torch.ops.comfy_kitchen.na3d(
-        q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
-        [1, *kernel_size], [False, *is_causal], scale,
+        q.unsqueeze(1),
+        k.unsqueeze(1),
+        v.unsqueeze(1),
+        [1, *kernel_size],
+        [False, *is_causal],
+        scale,
     )
     return out.squeeze(1)
 
@@ -341,7 +362,9 @@ def group_norm_silu_pad3d(
     x [B, C, T, H, W]; pad is (left, right, top, bottom, front): reflect in space,
     zero frames in front. weight=None is pad-only. Output is channels_last_3d.
     """
-    return torch.ops.comfy_kitchen.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, list(pad), silu)
+    return torch.ops.comfy_kitchen.group_norm_silu_pad3d(
+        x, weight, bias, num_groups, eps, list(pad), silu
+    )
 
 
 def rms_adaln(
@@ -446,7 +469,9 @@ def quantize_nvfp4(
     Returns:
         Tuple of (quantized_tensor, block_scales)
     """
-    return torch.ops.comfy_kitchen.quantize_nvfp4(x, per_tensor_scale, epsilon, pad_16x, hi_first)
+    return torch.ops.comfy_kitchen.quantize_nvfp4(
+        x, per_tensor_scale, epsilon, pad_16x, hi_first
+    )
 
 
 def dequantize_nvfp4(
@@ -471,7 +496,9 @@ def dequantize_nvfp4(
         Dequantized tensor in specified output format
     """
     dtype_code = DTYPE_TO_CODE[output_type]
-    return torch.ops.comfy_kitchen.dequantize_nvfp4(qx, per_tensor_scale, block_scales, dtype_code, hi_first)
+    return torch.ops.comfy_kitchen.dequantize_nvfp4(
+        qx, per_tensor_scale, block_scales, dtype_code, hi_first
+    )
 
 
 def scaled_mm_nvfp4(
@@ -507,8 +534,15 @@ def scaled_mm_nvfp4(
         out_dtype = torch.bfloat16
     dtype_code = DTYPE_TO_CODE[out_dtype]
     return torch.ops.comfy_kitchen.scaled_mm_nvfp4(
-        a, b, tensor_scale_a, tensor_scale_b,
-        block_scale_a, block_scale_b, bias, dtype_code, alpha
+        a,
+        b,
+        tensor_scale_a,
+        tensor_scale_b,
+        block_scale_a,
+        block_scale_b,
+        bias,
+        dtype_code,
+        alpha,
     )
 
 
@@ -611,7 +645,12 @@ def quantize_svdquant_w4a4(
     as bf16/fp16; this avoids an otherwise redundant cast/allocation.
     """
     return torch.ops.comfy_kitchen.quantize_svdquant_w4a4(
-        x, smooth, lora_down, pad_size, act_unsigned, lora_x,
+        x,
+        smooth,
+        lora_down,
+        pad_size,
+        act_unsigned,
+        lora_x,
     )
 
 
@@ -735,8 +774,11 @@ def rms_rope(
 
 
 def rms_rope_(
-    q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor,
-    q_scale: torch.Tensor, k_scale: torch.Tensor | None = None,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply RMSNorm and interleaved RoPE in place (inference only)."""
@@ -755,7 +797,9 @@ def rms_rope1(
 
 
 def rms_rope1_(
-    x: torch.Tensor, freqs_cis: torch.Tensor, scale: torch.Tensor,
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
     epsilon: float = 1e-6,
 ) -> torch.Tensor:
     """Apply RMSNorm and interleaved RoPE in place (inference only)."""
@@ -778,13 +822,19 @@ def rms_rope_split_half(
     restricts the rotation to a head-dim prefix (partial rotary; the norm
     always spans the full head_dim); 0 rotates everything.
     """
-    return torch.ops.comfy_kitchen.rms_rope_split_half(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim)
+    return torch.ops.comfy_kitchen.rms_rope_split_half(
+        q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim
+    )
 
 
 def rms_rope_split_half_(
-    q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor,
-    q_scale: torch.Tensor, k_scale: torch.Tensor | None = None,
-    epsilon: float = 1e-6, rot_dim: int = 0,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply RMSNorm and split-half RoPE in place (inference only).
 
@@ -811,7 +861,9 @@ def rms_rope_split_half1(
 
 
 def rms_rope_split_half1_(
-    x: torch.Tensor, freqs_cis: torch.Tensor, scale: torch.Tensor,
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
     epsilon: float = 1e-6,
 ) -> torch.Tensor:
     """Apply RMSNorm and split-half RoPE in place (inference only)."""
@@ -897,9 +949,7 @@ def apply_rope_split_half1(
     return torch.ops.comfy_kitchen.apply_rope_split_half1(x, freqs_cis)
 
 
-def apply_rope_split_half1_(
-    x: torch.Tensor, freqs_cis: torch.Tensor
-) -> torch.Tensor:
+def apply_rope_split_half1_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """Apply split-half RoPE in place (inference only)."""
     torch.ops.comfy_kitchen.apply_rope_split_half1_(x, freqs_cis)
     return x
@@ -948,7 +998,9 @@ def fp16_linear(
     Same numerics as ``torch.backends.cuda.matmul.allow_fp16_accumulation``, so
     route here only when the user opted into that mode.
     """
-    if not _fp16_linear_fills_gpu(x.shape[:-1].numel(), weight.shape[0], weight.shape[1]):
+    if not _fp16_linear_fills_gpu(
+        x.shape[:-1].numel(), weight.shape[0], weight.shape[1]
+    ):
         # cuBLAS (already fp16-accumulate when the caller opted in) wins outright
         # below these sizes, and the dispatch alone would cost more than the call
         out = torch.nn.functional.linear(x, weight, bias)
